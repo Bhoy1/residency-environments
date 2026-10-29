@@ -1,5 +1,35 @@
 import gymnasium
 import numpy as np
+from minigrid.envs.babyai.core.verifier import AfterInstr, BeforeInstr, OpenInstr
+
+
+class _BeforeDoors(BeforeInstr):
+    def verify(self, action):
+        if self.a_done == "success":
+            return super().verify(action)
+        self.a_done = self.instr_a.verify(action)
+        if self.a_done == "failure":
+            return "failure"
+        if self.a_done == "success":
+            # One toggle cannot also complete a different door's instruction.
+            return "continue"
+        if self.strict and self.instr_b.verify(action) == "success":
+            return "failure"
+        return "continue"
+
+
+class _AfterDoors(AfterInstr):
+    def verify(self, action):
+        if self.b_done == "success":
+            return super().verify(action)
+        self.b_done = self.instr_b.verify(action)
+        if self.b_done == "failure":
+            return "failure"
+        if self.b_done == "success":
+            return "continue"
+        if self.strict and self.instr_a.verify(action) == "success":
+            return "failure"
+        return "continue"
 
 
 class BabyAI:
@@ -101,33 +131,21 @@ class BabyAI:
                     self.obs_to_reward.remove(pattern)
                     break
 
-    def update(self, action, obs, reward, done, infos):  # update the environment after taking an action
+    def update(self, action, obs, infos):
         for k, v in infos.items():
             self.infos[k] = v
 
-        self.done = done
         self.history.append(("action", action))
-        self.history.append(("reward", reward))
+        self.history.append(("reward", self.reward))
 
         new_obs, new_action_space = self.postprocess_obs(obs)
 
-        if self.done:
+        if self.is_success:
             new_obs += "\n The task is completed."
-
-        if self.obs_to_reward is not None:
-            self.update_reward(new_obs)
-        else:
-            self.reward = reward
-
-        if self.done:  # in case the model find a way to skip a step
-            if self.reward <= 0.5:
-                self.done = False
-
-        if (
-            self.reward == 1 and not self.done
-        ):  # if the agent has already reached the goal, but the task is not completed, we fix the error.
-            self.done = True
-            new_obs += "\n The task is completed."
+        elif self.truncated:
+            new_obs += "\n The episode ended because the simulator step limit was reached."
+        elif self.done:
+            new_obs += "\n The episode ended without completing the task."
 
         self.history.append(("state", new_obs))
         self.states.append(new_obs)
@@ -144,6 +162,29 @@ class BabyAI:
         self.infos["history"] = self.history
         self.infos["steps"] = self.steps
         self.infos["state"] = self.states[-1]
+        self.infos["is_success"] = self.is_success
+        self.infos["termination_reason"] = self.termination_reason
+
+    def _record_primitive(self, obs, native_reward, terminated, truncated):
+        description, _ = self.postprocess_obs(obs, build_actions=False)
+        self.update_reward(description)
+        self.is_success = bool(terminated and native_reward > 0)
+        self.done = bool(terminated or truncated)
+        self.truncated = bool(truncated and not self.is_success)
+        if self.is_success:
+            self.reward = 1.0
+            self.termination_reason = "success"
+        else:
+            if self.obs_to_reward is not None:
+                # Annotation completion alone is not proof of task completion.
+                partial_ceiling = (self.num_obs_to_reward - 1) / self.num_obs_to_reward
+                self.reward = min(self.reward, partial_ceiling)
+            if self.truncated:
+                self.termination_reason = "step_limit"
+            elif terminated:
+                self.termination_reason = "failure"
+            else:
+                self.termination_reason = "running"
 
     def update_info(
         self, action, info
@@ -233,7 +274,7 @@ class BabyAI:
         return None
 
     def postprocess_obs(
-        self, obs
+        self, obs, build_actions=True
     ):  # postprocess the observation, translate the observation into description and possible actions
 
         _, vis_mask = self.base_env.gen_obs_grid()
@@ -371,6 +412,9 @@ class BabyAI:
             carry_description = "You are not carrying anything."
 
         description = obj_description + barrier_description + carry_description
+
+        if not build_actions:
+            return description, {}
 
         # ---------------------------finish processing the description of the goal--------------------------------
 
@@ -649,15 +693,12 @@ class BabyAI:
 
     def reset(self):
         obs, infos = self.env.reset(seed=self.seed)
+        self._prepare_ordered_doors()
         if self.store_all_obs_to_reward is not None:
             self.obs_to_reward = self.store_all_obs_to_reward.copy()
         else:
             self.obs_to_reward = None
         self.goal = self.base_env.mission
-        if "then" in self.goal:
-            self.goal = self.goal.replace("then", "and")
-        if "after you" in self.goal:
-            self.goal = self.goal.replace("after you", "and")
 
         description, possible_actions = self.postprocess_obs(
             obs
@@ -684,6 +725,26 @@ class BabyAI:
         self.reward = 0
         self.points = 0
         self.done = False
+        self.is_success = False
+        self.truncated = False
+        self.termination_reason = "running"
+        self.infos["is_success"] = False
+        self.infos["termination_reason"] = "running"
+
+    def _prepare_ordered_doors(self):
+        instruction = self.base_env.instrs
+        replacements = {BeforeInstr: _BeforeDoors, AfterInstr: _AfterDoors}
+        replacement = replacements.get(type(instruction))
+        if replacement is None:
+            return
+        first, second = instruction.instr_a, instruction.instr_b
+        if not isinstance(first, OpenInstr) or not isinstance(second, OpenInstr):
+            return
+        if any(a is b for a in first.desc.obj_set for b in second.desc.obj_set):
+            return
+        corrected = replacement(first, second, strict=instruction.strict)
+        corrected.reset_verifier(self.base_env)
+        self.base_env.instrs = corrected
 
     def verify_action(self, action, obs):
         # verify if the action is implemented correctly
@@ -709,6 +770,8 @@ class BabyAI:
             return True, None
 
     def step(self, action):
+        if self.done:
+            return self._get_obs(), self.reward, self.done, self.infos
         action = action.lower()
         action = action.strip()
         is_valid, error = self.check_action_is_valid(action)
@@ -726,19 +789,17 @@ class BabyAI:
 
             if action_list == []:
                 self.update_info(action, "No change in state.")
+                self.infos["action_is_valid"] = True
                 return self._get_obs(), self.reward, self.done, self.infos
 
             for action_step in action_list:
                 obs, reward, done, truncated, infos = self.env.step(action_step)  # five returns using the new step API
-                if not self.verify_action(action_step, obs):
-                    break  # if the action is not implemented correctly, stop taking the next action, and return the current observation
-                else:
-                    self.obs_2d = obs[
-                        "image"
-                    ]  # update the 2d observation, as we need to check if the action is implemented correctly at a lower granularity
-            self.update(
-                action, obs, reward, done, infos
-            )  # update the environment after all the low-level actions are taken
+                changed = self.verify_action(action_step, obs)
+                self._record_primitive(obs, reward, done, truncated)
+                self.obs_2d = obs["image"]
+                if self.done or not changed:
+                    break
+            self.update(action, obs, infos)
             self.infos["action_is_valid"] = True
             return self._get_obs(), self.reward, self.done, self.infos
 

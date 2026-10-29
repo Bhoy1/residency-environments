@@ -256,7 +256,7 @@ class _BabyAIRollout:
                 self.state.invalid_actions += 1
             self.state.progress = max(self.state.progress, float(reward))
             self.state.done = bool(done)
-            self.state.won = bool(done and float(reward) >= 1.0)
+            self.state.won = bool(info["is_success"])
         return [{"role": "user", "content": f"Observation: {observation}\nAction:"}]
 
     def close(self) -> None:
@@ -318,6 +318,7 @@ class BabyAIEnv(vf.Env[BabyAIEnvConfig]):
                     segment = await interaction.turn(messages)
             finally:
                 trace.info["babyai_state"] = trace.state.model_dump()
+                trace.info["babyai_termination_reason"] = rollout.env.infos["termination_reason"]
                 rollout.close()
 
 
