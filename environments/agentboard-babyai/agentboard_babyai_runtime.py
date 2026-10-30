@@ -91,6 +91,8 @@ class BabyAI:
         if "**" not in pattern:
             split_token = "*"
         pattern_list = pattern.strip().split(split_token)
+        if not any(fragment.strip(". \t\r\n") for fragment in pattern_list):
+            return False
         all_obs = obs.split(".")
         for obs_temp in all_obs:
             flag = True
